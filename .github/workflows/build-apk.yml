@@ -25,8 +25,6 @@ jobs:
 
       - name: Locate Android SDK
         run: |
-          echo "ANDROID_HOME=${ANDROID_HOME}"
-          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT}"
           SDKROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
           echo "SDKROOT=$SDKROOT" >> "$GITHUB_ENV"
           echo "$SDKROOT/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
@@ -38,23 +36,27 @@ jobs:
           if [ ! -x "$SDKMANAGER" ]; then
             SDKMANAGER=$(find "$SDKROOT/cmdline-tools" -type f -name sdkmanager 2>/dev/null | head -1)
           fi
-          echo "Using sdkmanager: $SDKMANAGER"
           test -n "$SDKMANAGER"
           yes | "$SDKMANAGER" --licenses >/dev/null || true
           "$SDKMANAGER" "platforms;android-35" "build-tools;35.0.0"
 
-      - name: Build installable debug APK
-        run: gradle --no-daemon :app:assembleDebug
-
-      - name: Rename APK
+      - name: Build debug and unsigned release APKs
         run: |
-          mkdir -p dist
-          cp app/build/outputs/apk/debug/app-debug.apk "dist/心理老师工作台-V3.6.1.apk"
-          sha256sum "dist/心理老师工作台-V3.6.1.apk" > "dist/心理老师工作台-V3.6.1_SHA256.txt"
+          gradle --no-daemon :app:assembleDebug :app:assembleRelease
+
+      - name: Prepare artifacts and signing tools
+        run: |
+          mkdir -p dist/signing-tools
+          cp app/build/outputs/apk/debug/app-debug.apk "dist/心理老师工作台-V3.6.1-debug.apk"
+          cp app/build/outputs/apk/release/app-release-unsigned.apk "dist/心理老师工作台-V3.6.1-release-unsigned.apk"
+          cp "$SDKROOT/build-tools/35.0.0/lib/apksigner.jar" dist/signing-tools/apksigner.jar
+          cp "$SDKROOT/build-tools/35.0.0/zipalign" dist/signing-tools/zipalign
+          chmod +x dist/signing-tools/zipalign
+          sha256sum dist/*.apk > dist/SHA256.txt
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: psy-workbench-android-v3.6.1
-          path: dist/*
+          name: psy-workbench-android-v3.6.1-build
+          path: dist/**
           if-no-files-found: error
