@@ -1,0 +1,31 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'cn.edu.psyworkbench.mobile'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId 'cn.edu.psyworkbench.mobile'
+        minSdk 28
+        targetSdk 35
+        versionCode 36101
+        versionName '3.6.1'
+    }
+
+    buildTypes {
+        debug {
+            minifyEnabled false
+        }
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
