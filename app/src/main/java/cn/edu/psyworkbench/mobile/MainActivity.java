@@ -4,16 +4,16 @@ import android.app.Activity;
 import android.app.AlertDialog;
 import android.app.DownloadManager;
 import android.app.KeyguardManager;
-import android.content.Context;
+import android.hardware.biometrics.BiometricPrompt;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.graphics.Bitmap;
-import android.hardware.biometrics.BiometricPrompt;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.CancellationSignal;
 import android.os.Environment;
 import android.view.View;
+import android.view.WindowManager;
 import android.webkit.CookieManager;
 import android.webkit.JavascriptInterface;
 import android.webkit.ValueCallback;
@@ -32,14 +32,18 @@ public class MainActivity extends Activity {
     private static final String DEFAULT_SERVER = "http://111.230.150.161";
     private static final int FILE_CHOOSER_REQUEST = 9001;
     private static final int DEVICE_CREDENTIAL_REQUEST = 9002;
+    private static final long AUTO_LOCK_MS = 5 * 60 * 1000L;
 
     private WebView webView;
     private ProgressBar progress;
     private ValueCallback<Uri[]> fileCallback;
     private SharedPreferences prefs;
     private CancellationSignal biometricCancel;
-    private boolean loaded = false;
-    private boolean credentialPromptOpen = false;
+    private Runnable pendingUnlockSuccess;
+    private long backgroundAt = 0L;
+    private boolean firstResume = true;
+    private boolean authInProgress = false;
+    private boolean loadedOnce = false;
 
     @Override public void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -48,7 +52,11 @@ public class MainActivity extends Activity {
         webView = findViewById(R.id.webview);
         progress = findViewById(R.id.progress);
         configureWebView();
-        authenticateThenLoad();
+        protectRecents(true);
+        authenticate(() -> {
+            protectRecents(false);
+            loadMobile();
+        });
     }
 
     private void configureWebView() {
@@ -59,13 +67,13 @@ public class MainActivity extends Activity {
         s.setAllowFileAccess(false);
         s.setAllowContentAccess(true);
         s.setCacheMode(WebSettings.LOAD_DEFAULT);
-        s.setUserAgentString(s.getUserAgentString() + " PsyWorkbenchAndroid/3.6.1");
+        s.setUserAgentString(s.getUserAgentString() + " PsyWorkbenchAndroid/3.7.0");
         s.setMixedContentMode(WebSettings.MIXED_CONTENT_NEVER_ALLOW);
         WebView.setWebContentsDebuggingEnabled(false);
         CookieManager.getInstance().setAcceptCookie(true);
         CookieManager.getInstance().setAcceptThirdPartyCookies(webView, false);
-
         webView.addJavascriptInterface(new AndroidBridge(), "AndroidApp");
+
         webView.setWebViewClient(new WebViewClient() {
             @Override public void onPageStarted(WebView view, String url, Bitmap favicon) {
                 progress.setVisibility(View.VISIBLE);
@@ -83,6 +91,12 @@ public class MainActivity extends Activity {
             }
             @Override public void onReceivedError(WebView view, int errorCode, String description, String failingUrl) {
                 progress.setVisibility(View.GONE);
+                if (failingUrl != null && failingUrl.startsWith(serverBase())) {
+                    String html = "<html><head><meta name='viewport' content='width=device-width,initial-scale=1'>" +
+                            "<style>body{font-family:sans-serif;background:#f4f4ef;color:#3d4941;padding:28px}div{background:#fffefa;border-radius:18px;padding:20px;border:1px solid #e4e3dc}button{width:100%;padding:12px;border:0;border-radius:12px;background:#70836d;color:white;font-size:16px}</style></head>" +
+                            "<body><div><h3>暂时无法连接工作台</h3><p>请检查网络，或稍后再试。已填写但尚未提交的跟进记录会保留在手机草稿中。</p><button onclick='AndroidApp.reloadApp()'>重新连接</button></div></body></html>";
+                    view.loadDataWithBaseURL(serverBase(), html, "text/html", "utf-8", null);
+                }
             }
         });
 
@@ -90,7 +104,8 @@ public class MainActivity extends Activity {
             @Override public boolean onShowFileChooser(WebView webView, ValueCallback<Uri[]> callback, FileChooserParams params) {
                 if (fileCallback != null) fileCallback.onReceiveValue(null);
                 fileCallback = callback;
-                try { startActivityForResult(params.createIntent(), FILE_CHOOSER_REQUEST); }
+                Intent intent = params.createIntent();
+                try { startActivityForResult(intent, FILE_CHOOSER_REQUEST); }
                 catch (Exception e) {
                     fileCallback = null;
                     Toast.makeText(MainActivity.this, "无法打开文件选择器", Toast.LENGTH_SHORT).show();
@@ -99,7 +114,8 @@ public class MainActivity extends Activity {
             }
         });
 
-        webView.setDownloadListener((url, userAgent, disposition, mime, length) -> download(url, userAgent, disposition, mime));
+        webView.setDownloadListener((url, userAgent, contentDisposition, mimetype, contentLength) ->
+                confirmSensitiveDownload(url, userAgent, contentDisposition, mimetype));
     }
 
     private boolean isAllowedHost(Uri uri) {
@@ -111,52 +127,79 @@ public class MainActivity extends Activity {
         } catch (Exception e) { return false; }
     }
 
-    private void authenticateThenLoad() {
+    private void authenticate(Runnable onSuccess) {
+        if (authInProgress) return;
+        pendingUnlockSuccess = onSuccess;
         if (!prefs.getBoolean("biometric_enabled", true) || android.os.Build.VERSION.SDK_INT < 28) {
-            loadMobile();
-            return;
+            completeUnlock(); return;
         }
+        authInProgress = true;
         try {
             BiometricPrompt prompt = new BiometricPrompt.Builder(this)
                     .setTitle("解锁心理老师工作台")
                     .setSubtitle("请验证指纹/面容后进入学生心理数据")
-                    .setNegativeButton("使用系统解锁", getMainExecutor(), (dialog, which) -> deviceCredentialOrLoad())
-                    .build();
+                    .setNegativeButton("使用系统解锁", getMainExecutor(), (dialog, which) -> {
+                        authInProgress = false;
+                        deviceCredentialOrRun();
+                    }).build();
             biometricCancel = new CancellationSignal();
             prompt.authenticate(biometricCancel, getMainExecutor(), new BiometricPrompt.AuthenticationCallback() {
-                @Override public void onAuthenticationSucceeded(BiometricPrompt.AuthenticationResult result) { loadMobile(); }
-                @Override public void onAuthenticationError(int errorCode, CharSequence errString) { deviceCredentialOrLoad(); }
+                @Override public void onAuthenticationSucceeded(BiometricPrompt.AuthenticationResult result) {
+                    authInProgress = false;
+                    completeUnlock();
+                }
+                @Override public void onAuthenticationError(int errorCode, CharSequence errString) {
+                    authInProgress = false;
+                    deviceCredentialOrRun();
+                }
             });
-        } catch (Exception e) { deviceCredentialOrLoad(); }
+        } catch (Exception e) {
+            authInProgress = false;
+            deviceCredentialOrRun();
+        }
     }
 
-    private void deviceCredentialOrLoad() {
-        if (loaded || credentialPromptOpen) return;
-        KeyguardManager km = (KeyguardManager) getSystemService(KEYGUARD_SERVICE);
+    private void deviceCredentialOrRun() {
+        KeyguardManager km = (KeyguardManager)getSystemService(KEYGUARD_SERVICE);
         if (km != null && km.isDeviceSecure()) {
             Intent i = km.createConfirmDeviceCredentialIntent("解锁心理老师工作台", "验证手机锁屏密码后继续");
-            if (i != null) {
-                credentialPromptOpen = true;
-                startActivityForResult(i, DEVICE_CREDENTIAL_REQUEST);
-                return;
-            }
+            if (i != null) { startActivityForResult(i, DEVICE_CREDENTIAL_REQUEST); return; }
         }
-        loadMobile();
+        completeUnlock();
+    }
+
+    private void completeUnlock() {
+        protectRecents(false);
+        Runnable r = pendingUnlockSuccess;
+        pendingUnlockSuccess = null;
+        if (r != null) r.run();
+    }
+
+    private void protectRecents(boolean protect) {
+        if (protect) getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);
+        else getWindow().clearFlags(WindowManager.LayoutParams.FLAG_SECURE);
     }
 
     private String serverBase() {
         String v = prefs.getString("server_url", DEFAULT_SERVER);
         if (v == null || v.trim().isEmpty()) v = DEFAULT_SERVER;
         v = v.trim();
-        while (v.endsWith("/")) v = v.substring(0, v.length() - 1);
+        while (v.endsWith("/")) v = v.substring(0, v.length()-1);
         return v;
     }
 
     private void loadMobile() {
-        if (loaded) return;
-        loaded = true;
-        credentialPromptOpen = false;
+        loadedOnce = true;
         runOnUiThread(() -> webView.loadUrl(serverBase() + "/mobile/"));
+    }
+
+    private void confirmSensitiveDownload(String url, String userAgent, String disposition, String mime) {
+        new AlertDialog.Builder(this)
+                .setTitle("保存文件到手机？")
+                .setMessage("导出的学生档案、原始作答或筛查报告可能包含敏感信息。请仅保存在自己的工作手机，并避免通过非工作群聊转发。")
+                .setPositiveButton("继续保存", (d,w) -> download(url, userAgent, disposition, mime))
+                .setNegativeButton("取消", null)
+                .show();
     }
 
     private void download(String url, String userAgent, String disposition, String mime) {
@@ -169,42 +212,37 @@ public class MainActivity extends Activity {
             req.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
             String name = android.webkit.URLUtil.guessFileName(url, disposition, mime);
             req.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, name);
-            DownloadManager dm = (DownloadManager) getSystemService(DOWNLOAD_SERVICE);
+            DownloadManager dm = (DownloadManager)getSystemService(DOWNLOAD_SERVICE);
             dm.enqueue(req);
-            Toast.makeText(this, "文件正在下载到“下载”目录", Toast.LENGTH_LONG).show();
-        } catch (Exception e) {
-            Toast.makeText(this, "下载失败：" + e.getMessage(), Toast.LENGTH_LONG).show();
-        }
+            Toast.makeText(this, "文件已开始保存，请注意妥善保管", Toast.LENGTH_LONG).show();
+        } catch (Exception e) { Toast.makeText(this, "下载失败：" + e.getMessage(), Toast.LENGTH_LONG).show(); }
     }
 
     private void showServerSettings() {
-        EditText input = new EditText(this);
+        final EditText input = new EditText(this);
         input.setSingleLine(true);
         input.setText(serverBase());
         input.setSelectAllOnFocus(true);
         new AlertDialog.Builder(this)
                 .setTitle("服务器地址")
-                .setMessage("当前连接学校心理工作台服务器。以后配置域名 + HTTPS 后，可在这里切换到新地址。")
+                .setMessage("正常情况下不用修改。以后配置学校域名 + HTTPS 后，可在这里切换。")
                 .setView(input)
-                .setPositiveButton("保存并重连", (dialog, which) -> {
+                .setPositiveButton("保存并重连", (d,w) -> {
                     String v = input.getText().toString().trim();
                     if (!(v.startsWith("http://") || v.startsWith("https://"))) {
-                        Toast.makeText(this, "请输入以 http:// 或 https:// 开头的地址", Toast.LENGTH_LONG).show();
-                        return;
+                        Toast.makeText(this, "请输入以 http:// 或 https:// 开头的地址", Toast.LENGTH_LONG).show(); return;
                     }
                     prefs.edit().putString("server_url", v).apply();
                     CookieManager.getInstance().removeAllCookies(null);
-                    loaded = false;
                     loadMobile();
                 })
-                .setNegativeButton("取消", null)
-                .show();
+                .setNegativeButton("取消", null).show();
     }
 
     public class AndroidBridge {
         @JavascriptInterface public void openServerSettings() { runOnUiThread(() -> showServerSettings()); }
-        @JavascriptInterface public void reloadApp() { runOnUiThread(() -> webView.reload()); }
-        @JavascriptInterface public String appVersion() { return "3.6.1"; }
+        @JavascriptInterface public void reloadApp() { runOnUiThread(() -> loadMobile()); }
+        @JavascriptInterface public String appVersion() { return "3.7.0"; }
         @JavascriptInterface public boolean biometricEnabled() { return prefs.getBoolean("biometric_enabled", true); }
         @JavascriptInterface public void setBiometricEnabled(boolean enabled) { prefs.edit().putBoolean("biometric_enabled", enabled).apply(); }
         @JavascriptInterface public boolean isNativeApp() { return true; }
@@ -214,12 +252,31 @@ public class MainActivity extends Activity {
         super.onActivityResult(requestCode, resultCode, data);
         if (requestCode == FILE_CHOOSER_REQUEST) {
             if (fileCallback != null) {
-                fileCallback.onReceiveValue(WebChromeClient.FileChooserParams.parseResult(resultCode, data));
-                fileCallback = null;
+                Uri[] result = WebChromeClient.FileChooserParams.parseResult(resultCode, data);
+                fileCallback.onReceiveValue(result); fileCallback = null;
             }
         } else if (requestCode == DEVICE_CREDENTIAL_REQUEST) {
-            credentialPromptOpen = false;
-            if (resultCode == RESULT_OK) loadMobile(); else finish();
+            if (resultCode == RESULT_OK) completeUnlock();
+            else finish();
+        }
+    }
+
+    @Override protected void onStop() {
+        super.onStop();
+        backgroundAt = System.currentTimeMillis();
+        protectRecents(true);
+        if (webView != null) webView.onPause();
+    }
+
+    @Override protected void onResume() {
+        super.onResume();
+        if (firstResume) { firstResume = false; return; }
+        long away = backgroundAt == 0L ? 0L : System.currentTimeMillis() - backgroundAt;
+        if (loadedOnce && away >= AUTO_LOCK_MS && prefs.getBoolean("biometric_enabled", true)) {
+            authenticate(() -> { if (webView != null) webView.onResume(); });
+        } else {
+            protectRecents(false);
+            if (webView != null) webView.onResume();
         }
     }
 
