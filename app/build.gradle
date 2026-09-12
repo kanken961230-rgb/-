@@ -10,8 +10,8 @@ android {
         applicationId 'cn.edu.psyworkbench.mobile'
         minSdk 28
         targetSdk 35
-        versionCode 36101
-        versionName '3.6.1'
+        versionCode 37000
+        versionName '3.7.0'
     }
 
     buildTypes {
